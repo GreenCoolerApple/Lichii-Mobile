@@ -1,0 +1,139 @@
+name: Mobile Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Target platform
+        required: true
+        type: choice
+        default: android
+        options:
+          - android
+          - ios
+      build_type:
+        description: Build configuration
+        required: true
+        type: choice
+        default: Release
+        options:
+          - Release
+          - Debug
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-build-${{ github.ref }}-${{ inputs.platform }}
+  cancel-in-progress: false
+
+jobs:
+  android:
+    if: inputs.platform == 'android'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      ANDROID_NDK_VERSION: '27.2.12479018'
+    steps:
+      - name: Checkout source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "ndk;${ANDROID_NDK_VERSION}" "cmake;3.31.5" "platform-tools"
+
+      - name: Locate Android Gradle project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in src/android android; do
+            if [[ -f "$dir/gradlew" && ( -f "$dir/settings.gradle" || -f "$dir/settings.gradle.kts" ) ]]; then
+              echo "directory=$dir" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo '::error::No Gradle wrapper and settings file found in src/android or android. An Android app project is required to generate an APK.'
+          exit 1
+
+      - name: Build Android APK
+        working-directory: ${{ steps.project.outputs.directory }}
+        env:
+          BUILD_TYPE: ${{ inputs.build_type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          if [[ "$BUILD_TYPE" == 'Release' ]]; then
+            task=assembleRelease
+          else
+            task=assembleDebug
+          fi
+          ./gradlew "$task" --no-daemon --stacktrace --console=plain
+
+      - name: Verify APK output
+        id: apk
+        env:
+          PROJECT_DIR: ${{ steps.project.outputs.directory }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p apk-output
+          find "$PROJECT_DIR" -type f -name '*.apk' -path '*/build/outputs/apk/*' -print -exec cp -v {} apk-output/ \;
+          if ! compgen -G 'apk-output/*.apk' > /dev/null; then
+            echo '::error::Gradle finished without generating an APK.'
+            exit 1
+          fi
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lichii-Mobile-Android-${{ inputs.build_type }}
+          path: apk-output/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  ios:
+    if: inputs.platform == 'ios'
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Checkout source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install CMake
+        run: brew install cmake
+      - name: Configure iOS native build
+        run: |
+          cmake -S . -B build/ios -G Xcode \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DENABLE_QT=OFF \
+            -DENABLE_OPENGL=OFF \
+            -DENABLE_WERROR=OFF \
+            -DYUZU_TESTS=OFF \
+            -DBUILD_TESTING=OFF
+      - name: Build iOS native targets
+        run: cmake --build build/ios --config "${{ inputs.build_type }}" --parallel 4
+      - name: Upload iOS native artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lichii-iOS-native-${{ inputs.build_type }}
+          path: build/ios/**/*.a
+          if-no-files-found: warn
